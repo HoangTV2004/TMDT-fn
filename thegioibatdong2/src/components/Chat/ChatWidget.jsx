@@ -19,78 +19,67 @@ const ChatWidget = () => {
     const socketRef = useRef(null);
     const messagesEndRef = useRef(null);
 
-    // Fetch room details and setup socket connection
+    // Setup socket connection only when room exists
     useEffect(() => {
-        if (!user || user.role === 'admin') {
-            // Disconnect socket if user logs out or is an admin (Admin has their own dashboard)
+        if (!user || user.role === 'admin' || !room) {
+            // Disconnect socket if user logs out, is admin, or no room yet
             if (socketRef.current) {
                 socketRef.current.disconnect();
                 socketRef.current = null;
             }
-            setRoom(null);
-            setMessages([]);
-            setUnreadCount(0);
+            if (!room) {
+                setMessages([]);
+                setUnreadCount(0);
+            }
             return;
         }
 
-        const setupChat = async () => {
+        const setupSocket = async () => {
             try {
-                // 1. Get or create room
-                const res = await fetch(`${API}/api/chat/room`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ customer_id: user.id })
-                });
-                const result = await res.json();
-                if (result.success && result.data) {
-                    const roomData = result.data;
-                    setRoom(roomData);
-
-                    // 2. Fetch initial messages
-                    const messagesRes = await fetch(`${API}/api/chat/messages/${roomData.room_id}`);
-                    const messagesResult = await messagesRes.json();
-                    if (messagesResult.success) {
-                        setMessages(messagesResult.data);
-                        
-                        // Calculate initial unread messages from admin
-                        const unread = messagesResult.data.filter(
-                            msg => msg.sender_role === 'admin' && !msg.is_read
-                        ).length;
-                        setUnreadCount(unread);
-                    }
-
-                    // 3. Connect Socket
-                    const socket = io(API, { transports: ['websocket'] });
-                    socketRef.current = socket;
-
-                    socket.emit('join_chat_room', roomData.room_id);
-
-                    socket.on('new_chat_message', (newMsg) => {
-                        setMessages((prev) => {
-                            // Avoid duplicate messages
-                            if (prev.some(m => m.message_id === newMsg.message_id)) return prev;
-                            return [...prev, newMsg];
-                        });
-
-                        // Unread management
-                        if (newMsg.sender_role === 'admin') {
-                            setUnreadCount((prev) => {
-                                // If chat is open, immediately mark as read
-                                if (isOpen) {
-                                    socket.emit('mark_messages_read', { room_id: roomData.room_id, role: 'customer' });
-                                    return 0;
-                                }
-                                return prev + 1;
-                            });
-                        }
-                    });
+                // Fetch initial messages for existing room
+                const messagesRes = await fetch(`${API}/api/chat/messages/${room.room_id}`);
+                const messagesResult = await messagesRes.json();
+                if (messagesResult.success) {
+                    setMessages(messagesResult.data);
+                    
+                    // Calculate initial unread messages from admin
+                    const unread = messagesResult.data.filter(
+                        msg => msg.sender_role === 'admin' && !msg.is_read
+                    ).length;
+                    setUnreadCount(unread);
                 }
+
+                // Connect Socket
+                const socket = io(API, { transports: ['websocket'] });
+                socketRef.current = socket;
+
+                socket.emit('join_chat_room', room.room_id);
+
+                socket.on('new_chat_message', (newMsg) => {
+                    setMessages((prev) => {
+                        // Avoid duplicate messages
+                        if (prev.some(m => m.message_id === newMsg.message_id)) return prev;
+                        return [...prev, newMsg];
+                    });
+
+                    // Unread management
+                    if (newMsg.sender_role === 'admin') {
+                        setUnreadCount((prev) => {
+                            // If chat is open, immediately mark as read
+                            if (isOpen) {
+                                socket.emit('mark_messages_read', { room_id: room.room_id, role: 'customer' });
+                                return 0;
+                            }
+                            return prev + 1;
+                        });
+                    }
+                });
             } catch (error) {
                 console.error('Error setting up customer chat:', error);
             }
         };
 
-        setupChat();
+        setupSocket();
 
         return () => {
             if (socketRef.current) {
@@ -98,7 +87,7 @@ const ChatWidget = () => {
                 socketRef.current = null;
             }
         };
-    }, [user, user?.id]);
+    }, [user, room, isOpen]);
 
     // Handle chat panel open state
     useEffect(() => {
@@ -117,18 +106,52 @@ const ChatWidget = () => {
         }, 100);
     };
 
-    const handleSendMessage = (e) => {
+    const handleSendMessage = async (e) => {
         e.preventDefault();
-        if (!inputValue.trim() || !room || !socketRef.current) return;
+        if (!inputValue.trim()) return;
 
-        const messageData = {
-            room_id: room.room_id,
-            sender_id: user.id,
-            sender_role: 'customer',
-            message_text: inputValue.trim()
-        };
-
-        socketRef.current.emit('send_chat_message', messageData);
+        // If room doesn't exist yet, create it first
+        if (!room) {
+            try {
+                const res = await fetch(`${API}/api/chat/room`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ customer_id: user.id })
+                });
+                const result = await res.json();
+                if (!result.success || !result.data) {
+                    console.error('Failed to create chat room');
+                    return;
+                }
+                setRoom(result.data);
+                
+                // Setup socket after room is created
+                const socket = io(API, { transports: ['websocket'] });
+                socketRef.current = socket;
+                socket.emit('join_chat_room', result.data.room_id);
+                
+                // Send message with newly created room
+                const messageData = {
+                    room_id: result.data.room_id,
+                    sender_id: user.id,
+                    sender_role: 'customer',
+                    message_text: inputValue.trim()
+                };
+                socket.emit('send_chat_message', messageData);
+            } catch (error) {
+                console.error('Error creating room and sending message:', error);
+            }
+        } else if (socketRef.current) {
+            // Room exists, send message normally
+            const messageData = {
+                room_id: room.room_id,
+                sender_id: user.id,
+                sender_role: 'customer',
+                message_text: inputValue.trim()
+            };
+            socketRef.current.emit('send_chat_message', messageData);
+        }
+        
         setInputValue('');
         scrollToBottom();
     };
