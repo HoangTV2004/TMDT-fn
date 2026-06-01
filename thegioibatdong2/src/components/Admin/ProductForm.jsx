@@ -2,11 +2,23 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Plus, X, Tag, Image, Package, Trash2 } from 'lucide-react';
 import './ProductForm.css';
 
+const formatNumberWithDots = (val) => {
+    if (val === null || val === undefined || val === '') return '';
+    const clean = String(val).replace(/\D/g, '');
+    return clean.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+};
+
+const parseNumberFromDots = (str) => {
+    if (!str) return '';
+    return parseInt(String(str).replace(/\./g, ''), 10) || 0;
+};
+
+
 // Search for a spec value at top level OR one level deep inside nested groups
 // Checks an array of possible keys (like [field.key, field.label])
 const findSpecDetails = (specs, possibleKeys) => {
     if (!specs) return null;
-    
+
     // 1. Exact match first
     for (const targetKey of possibleKeys) {
         if (!targetKey) continue;
@@ -39,7 +51,7 @@ const findSpecDetails = (specs, possibleKeys) => {
     for (const targetKey of possibleKeys) {
         if (!targetKey) continue;
         const t = targetKey.toLowerCase();
-        
+
         const searchTerms = [t];
         if (synonyms[t]) searchTerms.push(...synonyms[t]);
 
@@ -50,7 +62,7 @@ const findSpecDetails = (specs, possibleKeys) => {
                 return { value: specs[k], originalKey: k, groupName: null };
             }
         }
-        
+
         // Check nested groups
         for (const groupKey in specs) {
             const group = specs[groupKey];
@@ -96,7 +108,12 @@ const ProductForm = ({ categorySlug, onChange, initialData, isEditing }) => {
     const [variants, setVariants] = useState(() => {
         return (initialData?.variants || []).map((v, i) => ({
             ...v,
-            id: v.id || `v-${Date.now()}-${i}`
+            id: v.variant_id || v.id || `v-${Date.now()}-${i}`,
+            variant_name: v.variant_name || v.color_name || '',
+            price: v.price ?? '',
+            stock: v.quantity ?? v.stock ?? v.amount ?? 0,
+            sku: v.sku || '',
+            price_base: v.price_base ?? 0
         }));
     });
 
@@ -155,7 +172,7 @@ const ProductForm = ({ categorySlug, onChange, initialData, isEditing }) => {
                 }
             }
         });
-        
+
         // Save the reverse mapping for reconstruction on save
         inputRef.current._keyMapping = fieldToOriginalKey;
 
@@ -334,6 +351,12 @@ const ProductForm = ({ categorySlug, onChange, initialData, isEditing }) => {
         ));
     };
 
+    const removeExistingVariantGalleryImage = (variantIndex, imgPath) => {
+        setVariants(prev => prev.map((v, idx) =>
+            idx === variantIndex ? { ...v, local_gallery: (v.local_gallery || []).filter(path => path !== imgPath) } : v
+        ));
+    };
+
     const removeVariant = (index) => {
         setVariants(prev => prev.filter((_, i) => i !== index));
     };
@@ -460,7 +483,20 @@ const ProductForm = ({ categorySlug, onChange, initialData, isEditing }) => {
                                             onClick={() => document.getElementById(`variant-image-${variant.id}`).click()}
                                         >
                                             {variant.image ? (
-                                                <img src={getImgSrc(variant.image)} alt="V" />
+                                                <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+                                                    <img src={getImgSrc(variant.image)} alt="V" />
+                                                    <button
+                                                        type="button"
+                                                        className="btn-remove-gallery-img"
+                                                        style={{ zIndex: 10, top: '4px', right: '4px' }}
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            handleVariantImageChange(index, null);
+                                                        }}
+                                                    >
+                                                        <X size={12} />
+                                                    </button>
+                                                </div>
                                             ) : (variant.local_gallery?.[0]) ? (
                                                 <img src={getImgSrc(variant.local_gallery[0])} alt="V" />
                                             ) : (
@@ -495,20 +531,23 @@ const ProductForm = ({ categorySlug, onChange, initialData, isEditing }) => {
                                         <div className="form-field-group">
                                             <label className="admin-form-label-sm">Giá bán (đ)</label>
                                             <input
-                                                type="number"
+                                                type="text"
                                                 className="form-field-input"
                                                 placeholder="Giá riêng"
-                                                value={variant.price ?? ''}
-                                                onChange={(e) => handleVariantChange(index, 'price', e.target.value)}
+                                                value={formatNumberWithDots(variant.price)}
+                                                onChange={(e) => {
+                                                    const rawValue = parseNumberFromDots(e.target.value);
+                                                    handleVariantChange(index, 'price', rawValue);
+                                                }}
                                             />
                                         </div>
                                         <div className="form-field-group">
                                             <label className="admin-form-label-sm">Giá nhập (đ)</label>
                                             <input
-                                                type="number"
+                                                type="text"
                                                 className="form-field-input"
-                                                placeholder="0đ"
-                                                value={variant.price_base ?? 0}
+                                                placeholder="0"
+                                                value={formatNumberWithDots(variant.price_base)}
                                                 disabled={true}
                                                 style={{ backgroundColor: '#f1f5f9', cursor: 'not-allowed', color: '#64748b' }}
                                             />
@@ -549,10 +588,17 @@ const ProductForm = ({ categorySlug, onChange, initialData, isEditing }) => {
                                         <span className="admin-form-label-sm">Bộ sưu tập ảnh cho biến thể này</span>
                                     </div>
                                     <div className="variant-gallery-grid">
-                                        {/* Existing server images (read-only preview) */}
+                                        {/* Existing server images (with delete option) */}
                                         {(variant.local_gallery || []).map((imgPath, idx) => (
                                             <div key={`srv-${idx}`} className="gallery-item-mini">
                                                 <img src={getImgSrc(imgPath)} alt="gallery" />
+                                                <button
+                                                    type="button"
+                                                    className="btn-remove-gallery-img"
+                                                    onClick={() => removeExistingVariantGalleryImage(index, imgPath)}
+                                                >
+                                                    <X size={12} />
+                                                </button>
                                             </div>
                                         ))}
                                         {/* Newly uploaded files (can be removed) */}

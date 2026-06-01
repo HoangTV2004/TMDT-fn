@@ -481,7 +481,7 @@ router.get('/filters/:category', async (req, res) => {
                 const values = getDynamicUniqueValues(productsToScan, field);
                 if (values.length > 1 && values.length < productsToScan.length) {
                     const responseKey = field.toLowerCase()
-                        .replace(/\s+/g,'_')
+                        .replace(/\s+/g, '_')
                         .normalize("NFD")
                         .replace(/[\u0300-\u036f]/g, "");
 
@@ -645,7 +645,7 @@ router.post('/products/:category/filter', async (req, res) => {
                 totalPages,
                 currentPage: page,
                 limit,
-                column:column
+                column: column
             }
         });
     } catch (error) {
@@ -805,46 +805,86 @@ router.put('/update-price', async (req, res) => {
     }
 });
 
+router.post('/check-before-save', async (req, res) => {
+    const { id, name } = req.body;
+    try {
+        if (id) {
+            const [existing] = await sql`
+                SELECT product_id 
+                FROM product 
+                WHERE product_id = ${id} 
+                LIMIT 1
+            `;
+            if (!existing) {
+                return res.status(404).json({ success: false, message: "Sản phẩm cần sửa không tồn tại!" });
+            }
+            return res.json({ success: true, exists: true, productId: id });
+        } else {
+            const [existing] = await sql`
+                SELECT product_id 
+                FROM product 
+                WHERE name = ${name} 
+                LIMIT 1
+            `;
+            if (existing) {
+                return res.status(400).json({ success: false, message: "Sản phẩm với tên này đã tồn tại trong hệ thống!" });
+            }
+            return res.json({ success: true, exists: false, productId: `PROD-${Date.now()}` });
+        }
+    } catch (error) {
+        console.error("Lỗi API Check Before Save:", error.message);
+        res.status(500).json({ success: false, message: "Lỗi hệ thống khi kiểm tra sản phẩm", error: error.message });
+    }
+});
+
 router.post('/save', async (req, res) => {
     try {
-        const { id, name, category, price, weight, specs, variants, low_stock_threshold, base_price_numeric } = req.body;
+        const { id, name, category, price, weight, specs, variants, low_stock_threshold, base_price_numeric, img_thumb } = req.body;
 
         if (!name || !category) {
             return res.status(400).json({ success: false, message: "Vui lòng cung cấp tên và danh mục sản phẩm!" });
         }
 
-        const parsedSpecs = specs ? JSON.parse(specs) : {};
-        const parsedVariants = variants ? JSON.parse(variants) : [];
+        const parsedSpecs = specs ? (typeof specs === 'string' ? JSON.parse(specs) : specs) : {};
+        const parsedVariants = variants ? (typeof variants === 'string' ? JSON.parse(variants) : variants) : [];
         const numericPrice = price ? parseInt(price, 10) : 0;
         const numericWeight = weight ? parseFloat(weight) : null;
         const numericLowStock = low_stock_threshold !== undefined && low_stock_threshold !== '' ? parseInt(low_stock_threshold, 10) : 5;
         const numericBasePrice = base_price_numeric !== undefined && base_price_numeric !== '' ? parseFloat(base_price_numeric) : numericPrice;
+        const [catRecord] = await sql`
+            SELECT category_id 
+            FROM category 
+            WHERE slug = ${category} OR category_id::text = ${category} 
+            LIMIT 1
+        `;
+        const finalCategoryId = catRecord ? catRecord.category_id : 1;
 
-        let thumbPath = null;
-        if (req.files && Array.isArray(req.files)) {
-            const thumbFile = req.files.find(f => f.fieldname === 'thumbnail');
-            if (thumbFile) {
-                thumbPath = `/uploads/${thumbFile.filename}`;
-            }
-        }
-
+        let productId = id;
         await sql.begin(async (sql) => {
-            let productId = id;
             if (productId) {
                 const updateFields = {
-                    name: name, category_id: category, price: numericPrice,
-                    base_price_numeric: numericBasePrice, weight: numericWeight, specs: parsedSpecs,
+                    name: name,
+                    category_id: finalCategoryId,
+                    price: numericPrice,
+                    base_price_numeric: numericBasePrice,
+                    weight: numericWeight,
+                    specs: parsedSpecs,
                     low_stock_threshold: numericLowStock
                 };
-                if (thumbPath) updateFields.img_thumb = thumbPath;
+                if (img_thumb) {
+                    updateFields.img_thumb = img_thumb;
+                }
                 await sql`UPDATE product SET ${sql(updateFields)} WHERE product_id = ${productId}`;
             } else {
                 productId = `PROD-${Date.now()}`;
                 await sql`
                     INSERT INTO product (product_id, name, category_id, price, base_price_numeric, weight, specs, img_thumb, low_stock_threshold)
-                    VALUES (${productId}, ${name}, ${category}, ${numericPrice}, ${numericBasePrice}, ${numericWeight}, ${parsedSpecs}, ${thumbPath}, ${numericLowStock})
+                    VALUES (${productId}, ${name}, ${finalCategoryId}, ${numericPrice}, ${numericBasePrice}, ${numericWeight}, ${parsedSpecs}, ${img_thumb}, ${numericLowStock})
                 `;
             }
+
+            // Sync sequence trước khi INSERT biến thể mới để tránh lỗi duplicate PK
+            await sql`SELECT setval('productvariant_variant_id_seq', COALESCE((SELECT MAX(variant_id) FROM productvariant), 0))`;
 
             for (let i = 0; i < parsedVariants.length; i++) {
                 const v = parsedVariants[i];
@@ -852,14 +892,19 @@ router.post('/save', async (req, res) => {
                 const vPrice = v.price ? parseInt(v.price, 10) : numericPrice;
                 const vStock = v.stock ? parseInt(v.stock, 10) : 0;
                 const vPriceBase = v.price_base ? parseInt(v.price_base, 10) : 0;
-                const initialTotalValue = vStock * vPrice; // Giá vốn ban đầu
+                const initialTotalValue = vStock * vPrice;
 
-                const isNewVariant = !variantId || (typeof variantId === 'string' && variantId.startsWith('v-'));
+                // Coi là biến thể MỚI nếu: không có id, hoặc id là chuỗi tạm (v-...)
+                // Nếu id là số hoặc chuỗi số → là biến thể CŨ, cần UPDATE
+                const numericId = variantId && !String(variantId).startsWith('v-') ? Number(variantId) : null;
+                const isNewVariant = !numericId || isNaN(numericId);
+
+                const currentGallery = v.local_gallery || [];
 
                 if (isNewVariant) {
                     const newVar = await sql`
-                        INSERT INTO productvariant (product_id, color_name, price, price_base)
-                        VALUES (${productId}, ${v.variant_name || 'Mặc định'}, ${vPrice}, ${vPriceBase}) RETURNING variant_id
+                        INSERT INTO productvariant (product_id, color_name, price, price_base, local_gallery)
+                        VALUES (${productId}, ${v.variant_name || 'Mặc định'}, ${vPrice}, ${vPriceBase}, ${currentGallery}) RETURNING variant_id
                     `;
                     variantId = newVar[0].variant_id;
 
@@ -869,12 +914,13 @@ router.post('/save', async (req, res) => {
                     `;
                 } else {
                     await sql`
-                        UPDATE productvariant SET color_name = ${v.variant_name}, price = ${vPrice}, price_base = ${vPriceBase}
-                        WHERE variant_id = ${variantId} AND product_id = ${productId}
+                        UPDATE productvariant 
+                        SET color_name = ${v.variant_name || 'Mặc định'}, price = ${vPrice}, price_base = ${vPriceBase}, local_gallery = ${currentGallery}
+                        WHERE variant_id = ${numericId} AND product_id = ${productId}
                     `;
                     await sql`
                         INSERT INTO productinventory (variant_id, quantity, total_value, last_updated)
-                        VALUES (${variantId}, ${vStock}, ${initialTotalValue}, CURRENT_TIMESTAMP)
+                        VALUES (${numericId}, ${vStock}, ${initialTotalValue}, CURRENT_TIMESTAMP)
                             ON CONFLICT (variant_id) 
                         DO UPDATE SET
                             quantity = ${vStock},

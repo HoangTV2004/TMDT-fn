@@ -71,58 +71,220 @@ const ProductManager = () => {
 
         setIsSaving(true);
         try {
-            const formData = new FormData();
-            if (isEditing && editingProductId) {
-                formData.append('id', editingProductId);
+            const categorySlug = Object.keys(categoryMap).find(key => categoryMap[key] === activeCategory) || activeCategory.toLowerCase();
+
+            // --- BƯỚC 1: KIỂM TRA SẢN PHẨM TRƯỚC KHI LƯU ---
+            const checkPayload = {
+                id: isEditing ? editingProductId : null,
+                name: name
+            };
+
+            const checkRes = await fetch(`${import.meta.env.VITE_SERVER_API}/api/product/check-before-save`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(checkPayload)
+            });
+
+            if (!checkRes.ok) {
+                const errData = await checkRes.json();
+                showToast(errData.message || 'Sản phẩm đã tồn tại hoặc không hợp lệ!', 'error');
+                setIsSaving(false);
+                return;
             }
-            formData.append('name', name);
-            formData.append('category', Object.keys(categoryMap).find(key => categoryMap[key] === activeCategory) || activeCategory.toLowerCase());
-            formData.append('price', basePrice);
-            formData.append('weight', weight);
-            formData.append('base_price_numeric', basePriceNumeric);
-            formData.append('low_stock_threshold', lowStockThreshold);
-            if (thumbnail && thumbnail instanceof File) {
-                formData.append('thumbnail', thumbnail);
-            }
-            formData.append('specs', JSON.stringify(productData.specs));
-            formData.append('variants', JSON.stringify(productData.variants.map(v => ({
+
+            const { productId } = await checkRes.json();
+
+            // --- BƯỚC 2: TẢI ẢNH LÊN FILESERVER ---
+            let finalImgThumb = thumbnail;
+            let updatedVariants = productData.variants.map(v => ({
                 id: v.id,
                 variant_name: v.variant_name,
                 price: v.price,
                 stock: v.stock,
                 sku: v.sku,
-                price_base: v.price_base
-            }))));
+                price_base: v.price_base,
+                local_gallery: (v.local_gallery || []).map(path => {
+                    if (typeof path === 'string') {
+                        const parts = path.split('/');
+                        return parts[parts.length - 1];
+                    }
+                    return path;
+                })
+            }));
+
+            if (typeof finalImgThumb === 'string') {
+                const parts = finalImgThumb.split('/');
+                finalImgThumb = parts[parts.length - 1];
+            }
+
+            const imageFormData = new FormData();
+            imageFormData.append('category_id', categorySlug);
+            imageFormData.append('product_id', productId);
+
+            let hasNewImages = false;
+
+            if (thumbnail && thumbnail instanceof File) {
+                imageFormData.append('thumbnail', thumbnail);
+                hasNewImages = true;
+            }
 
             productData.variants.forEach((v, vIndex) => {
                 if (v.image && v.image instanceof File) {
-                    formData.append(`variant_image_${vIndex}`, v.image);
+                    imageFormData.append(`variant_image_${vIndex}`, v.image);
+                    hasNewImages = true;
                 }
                 if (v.gallery && Array.isArray(v.gallery)) {
                     v.gallery.forEach((file, gIndex) => {
                         if (file instanceof File) {
-                            formData.append(`variant_${vIndex}_gallery_${gIndex}`, file);
+                            imageFormData.append(`variant_${vIndex}_gallery_${gIndex}`, file);
+                            hasNewImages = true;
                         }
                     });
                 }
             });
 
+            if (hasNewImages) {
+                const photoServerBase = (import.meta.env.VITE_PHOTO_SERVER_API || 'http://localhost:8081/images')
+                    .replace(/\/images\/?$/, '');
+
+                const uploadRes = await fetch(`${photoServerBase}/photo/upload`, {
+                    method: 'POST',
+                    body: imageFormData
+                });
+
+                if (!uploadRes.ok) {
+                    throw new Error('Lỗi tải ảnh lên fileserver!');
+                }
+
+                const uploadResult = await uploadRes.json();
+                const uploadedFiles = uploadResult.files || {};
+
+                // Map kết quả trả về từ fileserver vào payload tương ứng
+                if (uploadedFiles['thumbnail']) {
+                    finalImgThumb = uploadedFiles['thumbnail'][0];
+                }
+
+                updatedVariants = updatedVariants.map((v, vIndex) => {
+                    let localGallery = [...(v.local_gallery || [])];
+
+                    // Nếu có ảnh variant chính mới
+                    if (uploadedFiles[`variant_image_${vIndex}`]) {
+                        const newMainImage = uploadedFiles[`variant_image_${vIndex}`][0];
+                        if (localGallery.length > 0) {
+                            localGallery[0] = newMainImage;
+                        } else {
+                            localGallery.push(newMainImage);
+                        }
+                    }
+
+                    // Nếu có các ảnh gallery mới
+                    Object.keys(uploadedFiles).forEach(key => {
+                        if (key.startsWith(`variant_${vIndex}_gallery_`)) {
+                            localGallery.push(...uploadedFiles[key]);
+                        }
+                    });
+
+                    return {
+                        ...v,
+                        local_gallery: localGallery
+                    };
+                });
+            }
+
+            const deletedFiles = [];
+            if (isEditing && editingProductId) {
+                const originalProduct = rawProducts.find(p => p.id === editingProductId);
+                if (originalProduct) {
+                    if (originalProduct.img_thumb) {
+                        const oldThumbName = originalProduct.img_thumb.split('/').pop();
+                        if (finalImgThumb !== oldThumbName) {
+                            deletedFiles.push(oldThumbName);
+                        }
+                    }
+
+                    const oldVariantFiles = [];
+                    (originalProduct.variants || []).forEach(v => {
+                        (v.local_gallery || []).forEach(path => {
+                            if (typeof path === 'string') {
+                                oldVariantFiles.push(path.split('/').pop());
+                            }
+                        });
+                    });
+
+                    const newVariantFiles = [];
+                    updatedVariants.forEach(v => {
+                        (v.local_gallery || []).forEach(filename => {
+                            if (filename) newVariantFiles.push(filename);
+                        });
+                    });
+
+                    oldVariantFiles.forEach(file => {
+                        if (!newVariantFiles.includes(file)) {
+                            deletedFiles.push(file);
+                        }
+                    });
+                }
+            }
+
+            // --- BƯỚC 3: GỬI PAYLOAD JSON THUẦN LÊN CORE SERVER ---
+            const minPrice = updatedVariants.length > 0
+                ? Math.min(...updatedVariants.map(v => parseInt(v.price, 10) || 0))
+                : 0;
+
+            const savePayload = {
+                id: isEditing ? editingProductId : null,
+                name: name,
+                category: categorySlug,
+                price: minPrice,
+                weight: weight,
+                base_price_numeric: minPrice,
+                low_stock_threshold: lowStockThreshold,
+                img_thumb: finalImgThumb,
+                specs: productData.specs,
+                variants: updatedVariants
+            };
+
             const response = await fetch(`${import.meta.env.VITE_SERVER_API}/api/product/save`, {
                 method: 'POST',
-                body: formData
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(savePayload)
             });
 
             if (response.ok) {
+                // Gọi API fileserver để xóa các tệp ảnh vật lý bị loại bỏ
+                if (deletedFiles.length > 0) {
+                    try {
+                        const photoServerBase = (import.meta.env.VITE_PHOTO_SERVER_API || 'http://localhost:8081/images')
+                            .replace(/\/images\/?$/, '');
+                        await fetch(`${photoServerBase}/photo/delete-files`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                category_id: categorySlug,
+                                product_id: isEditing ? editingProductId : productId,
+                                filenames: deletedFiles
+                            })
+                        });
+                        console.log("Đã gửi lệnh xóa vật lý các ảnh:", deletedFiles);
+                    } catch (delErr) {
+                        console.error("Lỗi khi xóa ảnh vật lý trên fileserver:", delErr);
+                    }
+                }
+
                 showToast('Lưu sản phẩm thành công!');
                 setShowProductModal(false);
                 resetForm();
                 loadData();
             } else {
-                showToast('Lỗi khi lưu sản phẩm!', 'error');
+                showToast('Lỗi khi lưu thông tin sản phẩm!', 'error');
             }
         } catch (err) {
             console.error('Error saving product:', err);
-            showToast('Lỗi kết nối server!', 'error');
+            showToast(err.message || 'Lỗi kết nối server!', 'error');
         } finally {
             setIsSaving(false);
         }
@@ -607,7 +769,7 @@ const ProductManager = () => {
                                         </td>
                                         <td>{(p.stock ?? 0) >= 1000 ? '999+' : (p.stock ?? 0)}</td>
                                         <td>
-                                            <span 
+                                            <span
                                                 className={`admin-badge ${p.status === 'Còn hàng' ? 'admin-badge-success' : p.status === 'Sắp hết hàng' ? 'admin-badge-warning' : 'admin-badge-danger'}`}
                                                 style={p.status === 'Sắp hết hàng' ? { background: 'rgba(245, 158, 11, 0.1)', color: '#f59e0b', border: '1px solid rgba(245, 158, 11, 0.2)' } : {}}
                                             >

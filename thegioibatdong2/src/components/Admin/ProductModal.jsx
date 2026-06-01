@@ -121,17 +121,7 @@ const ProductModal = ({
                                 ))}
                             </select>
                         </div>
-                        <div className="admin-form-group">
-                            <label className="admin-form-label">Giá bán</label>
-                            <input
-                                id="product-price"
-                                type="number"
-                                className="admin-form-input"
-                                placeholder="0đ"
-                                value={basePrice}
-                                onChange={(e) => setBasePrice(e.target.value)}
-                            />
-                        </div>
+
                         <div className="admin-form-group">
                             <label className="admin-form-label">Khối lượng (g)</label>
                             <input
